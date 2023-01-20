@@ -1,0 +1,2 @@
+style commands:
+jt -t solarizedl -tf merriserif -tfs 14 -nf ptsans -nfs 14
