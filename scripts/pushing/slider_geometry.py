@@ -63,7 +63,7 @@ class GridGeometry:
         pcd_indices = pcd + self.com        
         pcd_indices = pcd_indices / self.resols
 
-        pcd_indices = np.round(pcd_indices).astype(int)
+        pcd_indices = np.floor(pcd_indices).astype(int)
         mask = surface_grid[pcd_indices[:,0],pcd_indices[:,1]]
         pcd = pcd[mask]
         self.surface_pcd = np.array(pcd)
@@ -72,9 +72,8 @@ class GridGeometry:
         self.kd_tree = ss.KDTree(np.array(pcd), leafsize=10)
         # this can be used to project pt on the surface, since the "projection" is defined
         # to be the one with the shortest distance
-        
         return grid
-        
+
     def get_normal(self, p):
         # https://stackoverflow.com/questions/16195297/computing-normals-at-each-point-in-a-point-cloud
         # point cloud estimation of normal uses local region, and statistic fitting of the plane
@@ -82,38 +81,39 @@ class GridGeometry:
         # * here we use open3d to get the normal
         # find nearest pt in the pcd
         # p shape: B x 2
+        # NOTE: edit on Jan 20, changed from ":" to "..." to allow for multiple dimensions
+        # the output will always be B x 2
         dis, indices = self.kd_tree.query(p, k=1)
         indices = indices.reshape(-1)
         pt = self.kd_tree.data[indices] + self.com  # B x 2
         indices = pt / self.resols
-        indices = np.round(indices).astype(int)
-        grad = self.grid_grad[indices[:,0], indices[:,1]]  # B x 2
-        grad = grad / np.linalg.norm(grad, axis=1, keepdims=True)
+        indices = np.floor(indices).astype(int)
+        grad = self.grid_grad[indices[...,0], indices[...,1]]  # B x 2
+        grad = grad / np.linalg.norm(grad, axis=-1, keepdims=True)
         # pointing inward
         return -grad
     
-    def sample_pt(self):
+    def sample_pt(self, K=1):
         # sample a random pt on the surface
-        pt = np.random.choice(len(self.surface_pcd))
+        pt = np.random.choice(len(self.surface_pcd), size=K)
         pt = self.surface_pcd[pt]
+        if K == 1:
+            pt = pt.reshape(-1)  # for K=1 we ignore the first dim
         return pt
-        
-
-
-# In[3]:
-
-
-get_ipython().run_line_magic('matplotlib', '--list')
-
-# This is non-interactive: it shows static plots inline
-# %matplotlib inline
-
-# This is interactive: it shows dynamic plots in the notebook
-get_ipython().run_line_magic('matplotlib', 'notebook')
-
-# This is interactive: it shows dynamic plots in separate GUI windows
-# %matplotlib tk
-
+    
+    def check_pt_surface(self, pt):
+        """
+        check whether the pt is on the surface
+        pt: B x 2
+        """
+        pt = pt + self.com  # to transform to grid
+        idx = pt / self.resols
+        idx = np.floor(idx).astype(int)
+        # check if out of the map
+        if idx[0] < 0 or idx[0] >= self.masked_grid.shape[0] or \
+            idx[1] < 0 or idx[1] >= self.masked_grid.shape[1]:
+            return False
+        return self.masked_grid[idx[...,0], idx[...,1]] == 0  # 0 is surface
 
 # In[20]:
 
@@ -174,10 +174,4 @@ def vis_test1():
                   normals[i,0], normals[i,1], width=0.1, color='red')
 
     plt.show()
-
-
-# In[ ]:
-
-
-
 

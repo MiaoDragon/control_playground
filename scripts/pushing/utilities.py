@@ -6,6 +6,12 @@ def rot_mat_from_ang(ang):
     """
     return np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
 
+def transform_vec_to_mat(vec):
+    rot_mat = np.eye(3)
+    rot_mat[:2,:2] = rot_mat_from_ang(vec[2])
+    rot_mat[:2,2] = vec[:2]
+    return rot_mat
+
 def pcd_to_grid(pcd, resols):
     """
     produce a mask grid for the pcd
@@ -25,6 +31,6 @@ def pcd_to_grid(pcd, resols):
     grid = np.zeros(size).astype(bool)
 #     pcd_indices = pcd - pcd.min(axis=0)
     pcd_indices = pcd / resols
-    pcd_indices = np.round(pcd_indices).astype(int)
+    pcd_indices = np.floor(pcd_indices).astype(int)
     grid[pcd_indices[:,0], pcd_indices[:,1]] = 1
     return pcd-pcd.mean(axis=0), grid

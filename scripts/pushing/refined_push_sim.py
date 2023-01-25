@@ -1,6 +1,14 @@
+"""
+difference from v1:
+now we store the limit surface as a knn tree.
+we separate the storage of existing F as a size vector and a direction vector.
+Later when we have a new F input, we find the nearest F, and use the corresponding
+V
+"""
+
 
 import numpy as np
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, KDTree
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
@@ -32,7 +40,7 @@ class LimitSurface:
 
 
 class GridLimitSurface(LimitSurface):
-    def __init__(self, friction_coeff, pressure_dist, width, height):
+    def __init__(self, friction_coeff, pressure_dist, resols):
         """
         shape: 
         friction_coeff: NxM (width x height)
@@ -41,13 +49,17 @@ class GridLimitSurface(LimitSurface):
         super().__init__()
         self.friction_coeff = friction_coeff
         self.pressure_dist = pressure_dist
-        self.w = width
-        self.h = height
+        self.w = friction_coeff.shape[0] * resols[0]
+        self.h = friction_coeff.shape[1] * resols[1]
         self.mat_x, self.mat_y = np.indices(self.friction_coeff.shape)
         self.mat_x = self.mat_x
         self.mat_y = self.mat_y
-        self.hull = None
+        self.Fkdtree = None
+        self.Vkdtree = None
+        self.fs_length = None
+
         self.com = np.array([self.mat_x.shape[0]/2, self.mat_x.shape[1]/2])
+        self.resols = resols
     def get_load(self, twist):
         """
         given a twist in the shape of: Bx3, [x,y,omega]
@@ -83,61 +95,31 @@ class GridLimitSurface(LimitSurface):
     
     def construct_limit_surface(self, n_samples=2500, ax=None):
         twists = np.random.normal(size=(n_samples,3))
+        twists = twists / np.linalg.norm(twists, axis=1, keepdims=True)
         fs = self.get_load(twists)
-        print('fs: ')
-        print(fs)
-        hull = ConvexHull(fs)
+        self.fs_len = np.linalg.norm(fs, axis=1)
+        fs = fs / self.fs_len.reshape((-1,1))
+        self.Fkdtree = KDTree(fs, leafsize=20, copy_data=True)
+        self.Vkdtree = KDTree(twists, leafsize=20, copy_data=True)
 
-        # triple
-        x = fs[:,0]
-        y = fs[:,1]
-        z = fs[:,2]
-        # Triangulate parameter space to determine the triangles
-        tri = mtri.Triangulation(x,y,triangles=hull.simplices)
+        print('Fkdtree shape: ', self.Fkdtree.data.shape)
+        print('Vkdtree shape: ', self.Vkdtree.data.shape)
 
-        # Plot the surface.  The triangles in parameter space determine which x, y, z
-        # points are connected by an edge.
-        if ax is not None:
-            ax.plot_trisurf(x, y, z, triangles=tri.triangles, cmap=plt.cm.Spectral)
-        
-#         if ax is not None:
-#             ax.plot_trisurf(fs[:,0], fs[:,1], fs[:,2], linewidth=0.2, antialiased=True)
-        
-#         # Plot defining corner points
-#         if ax is not None:
-#             ax.plot(fs[:,0], fs[:,1], fs[:,2], "ko")
-
-#         # 12 = 2 * 6 faces are the simplices (2 simplices per square face)
-#         for s in hull.simplices:
-#             s = np.append(s, s[0])  # Here we cycle back to the first coordinate
-#             if ax is not None:
-#                 ax.plot(fs[s, 0], fs[s, 1], fs[s, 2], "r-")            
-        self.hull = hull
-        return hull
     def get_twist(self, F, plot_scale=0.1, ax=None):
-        # https://stackoverflow.com/questions/30486312/intersection-of-nd-line-with-convex-hull-in-python
-        if self.hull is None:
-            print('constructing hull...')
+        """
+        F: size of B x 3
+        """
+        if self.Fkdtree is None:
             self.construct_limit_surface(ax=ax)
-        # find the face that the force projects to
-        eq=self.hull.equations.T
-        V,b=eq[:-1].T,eq[-1]
-        alpha=-b/np.dot(V,F)
-        alpha[alpha<=0] = np.inf
-        face_idx = np.argmin(alpha)
-        proj_pt = alpha[face_idx]*F
-        # TODO: plot this
-        normal = self.hull.equations[face_idx,:-1]        
-        normal = normal / np.linalg.norm(normal)# * plot_scale
-        if ax is not None:
-            plt.plot([proj_pt[0],proj_pt[0]+plot_scale*normal[0]],
-                     [proj_pt[1],proj_pt[1]+plot_scale*normal[1]],
-                     [proj_pt[2],proj_pt[2]+plot_scale*normal[2]])
-        print('F: ', F)
-        print('projected point: ', proj_pt)
-        print('face point: ', self.hull.points[self.hull.simplices[face_idx,:],:])
-        print('normal: ', normal)
-        return normal
+
+        k = 5  # an average of the neighborhood
+        _, indices = self.Fkdtree.query(F/np.linalg.norm(F, axis=1, keepdims=True), k)  # indices: B x k
+        # find the corresponding Vs
+        Vs = self.Vkdtree.data[indices, :]  # B x k x 3
+        Vs = np.mean(Vs, axis=1)  # B x 3
+        Vs = Vs / np.linalg.norm(Vs, axis=1, keepdims=True)
+
+        return Vs
     def get_load_point_vel(self, p, v_p, v_err=1e-3, f_err=5e-2):
         """
         obtain the pushing force at point p, and the load F as a result of it
@@ -152,9 +134,7 @@ class GridLimitSurface(LimitSurface):
         """
         # * step 1: find candidate loads such that
         # v_p = J_p Delta H(F)
-        eq=self.hull.equations.T
-        V,b=eq[:-1].T,eq[-1]
-        V = np.array(V)
+        V = np.array(self.Vkdtree.data)
         V = V / np.linalg.norm(V, axis=1).reshape((-1,1))  # Bx3
         # find Jp V = v
         v = np.zeros((len(V),2))
@@ -164,18 +144,12 @@ class GridLimitSurface(LimitSurface):
         # cosine similarity is the largest
         sim = v.dot(v_p)/np.linalg.norm(v_p)
         # check the largest ones
-        print('sorted similarity scores: ')
-        print(np.sort(sim)[::-1])
+        # print('sorted similarity scores: ')
+        # print(np.sort(sim)[::-1])
         cand_mask = sim > (1-v_err)
-        cand_faces = self.hull.simplices[cand_mask, :]  # B x 3, indices of points
-        cand_loads = self.hull.points[cand_faces, :]  # select the indices of points
-                                                      # result shape: Bx3x3
-        cand_loads = np.mean(cand_loads, axis=1)  # result shape: Bx3
-        
-        # check if any points can satisfy the error
-        error = np.abs(p[0]*self.hull.points[:,1] - p[1]*self.hull.points[:,0] - 
-                       self.hull.points[:,2])
-        error = error / np.linalg.norm(self.hull.points, axis=1)
+        selected_V = V[cand_mask, :]
+
+        cand_loads = self.get_load(selected_V)
         
         # * step 2: from the candidates, select ones that satisfy:
         # F = J^T f, i.e., F[2] = p[0]F[1] - p[1]F[0]
@@ -183,24 +157,14 @@ class GridLimitSurface(LimitSurface):
         
         error = np.abs(p[0]*cand_loads[:,1] - p[1]*cand_loads[:,0] - cand_loads[:,2])
         error = error / np.linalg.norm(cand_loads, axis=1)
-        print('sorted errors: ')
-        print(np.sort(error))
+        # print('sorted errors: ')
+        # print(np.sort(error))
         cand = error < f_err
         # check whether it is solved: i.e. cand has at least one
         if np.sum(cand) == 0:
             return None
         return cand_loads[np.argmin(error)]
     
-#     def get_ls_f(self, vel):
-#         # find the force that corresponds to the normal direction vel
-#         # the one with the max inner product
-#         if self.hull is None:
-#             print('constructing hull...')
-#             self.construct_ls_db(ax=ax)
-
-#         vel = vel / np.linalg.norm(vel)
-#         idx = np.argmax(self.hull.points.dot(vel))
-#         return self.hull.points[idx]
 # In[43]:
 
 
@@ -243,8 +207,6 @@ def visualize(p, v_pusher, fl, fu, H, F, f):
     plt.annotate('f',
              xy=(p[0]+f[0]/2, p[1]+f[1]/2),
              color='blue')
-            #  xytext=(10, -10),
-            #  textcoords='offset points')
 
 
     # velocities
@@ -285,10 +247,8 @@ def point_pusher_model(p, v_pusher, fl, fu, H: LimitSurface, vis=None):
     # check the normals to the convex hull faces, and find the one closest to v_pusher
     F = H.get_load_point_vel(p, v_pusher, v_err=1e-3, f_err=1e-1)
     
-
-    print('load: ', F)
     if F is None:
-        print('unable to find sticking mode.')
+        pass
     else:
         # check the force to remain in the cone
         f = np.array(F[:2])
@@ -300,7 +260,6 @@ def point_pusher_model(p, v_pusher, fl, fu, H: LimitSurface, vis=None):
         if theta_f < theta_fl:
             theta_f += np.pi*2
         if theta_fl < theta_f and theta_f < theta_fu:
-            print('within cone')
             if vis:
                 visualize(p, v_pusher, fl, fu, H, F, f)
             return F
@@ -320,25 +279,9 @@ def point_pusher_model(p, v_pusher, fl, fu, H: LimitSurface, vis=None):
     vt = v - v.dot(normal)*normal  # get the tangent velocity
     if vt.dot(flt) >= 0:
         visualize(p, v_pusher, fl, fu, H, F, fl)
-        print('picking fl')
         return Fl
     else:
         F = np.array([fu[0], fu[1], p[0]*fu[1]-p[1]*fu[0]])
         Fu = np.array(F)
         visualize(p, v_pusher, fl, fu, H, F, fu)
-        print("picking fu")
         return Fu
-    # F = np.array([fu[0], fu[1], p[0]*fu[1]-p[1]*fu[0]])
-    # Fu = np.array(F)
-    # V = H.get_twist(F)
-    # # verify the difference
-    # v = np.zeros((2))
-    # v[0] = V[0] - p[1]*V[2]
-    # v[1] = V[1] + p[0]*V[2]
-    # normal = (fl+fu)/2
-    # fut = fu - fu.dot(normal)*normal
-    # vt = v - v.dot(normal)*normal  # get the tangent velocity
-    # if vt.dot(fut) >= 0:
-    #     visualize(p, v_pusher, fl, fu, H, F, fu)
-    #     print('picking fu')
-    #     return Fu
